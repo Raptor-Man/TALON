@@ -1,0 +1,685 @@
+import sys
+import os
+import hashlib
+import json
+import time
+from datetime import datetime
+import subprocess
+import csv
+from threading import Thread
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QWidget, QLabel, QGridLayout,
+                             QComboBox, QPushButton, QDialog, QLineEdit, QListWidget, QMessageBox,
+                             QTextEdit, QHBoxLayout, QProgressBar)
+from PyQt5.QtWebEngineWidgets import QWebEngineView
+from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QUrl
+import playsound
+import random
+from geopy.distance import geodesic
+from concurrent.futures import ThreadPoolExecutor
+import numpy as np
+
+class SettingsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        self.setGeometry(700, 300, 300, 200)
+        layout = QVBoxLayout()
+        self.radius_combo = QComboBox()
+        self.radius_combo.addItems(["0.5 km", "1 km", "2 km", "Custom"])
+        self.custom_input = QLineEdit()
+        self.custom_input.setPlaceholderText("Enter custom radius (km)")
+        layout.addWidget(QLabel("Threat Zone Radius:"))
+        layout.addWidget(self.radius_combo)
+        layout.addWidget(self.custom_input)
+        apply_btn = QPushButton("Apply")
+        apply_btn.clicked.connect(self.accept)
+        layout.addWidget(apply_btn)
+        self.setLayout(layout)
+
+    def get_radius(self):
+        if self.radius_combo.currentText() == "Custom" and self.custom_input.text():
+            return f"{self.custom_input.text()} km"
+        return self.radius_combo.currentText()
+
+class ReplayThread(QThread):
+    update_signal = pyqtSignal(dict)
+
+    def __init__(self, log_file, parent=None):
+        super().__init__(parent)
+        self.log_file = log_file
+        self.running = False
+        self.speed = 1.0
+
+    def run(self):
+        self.running = True
+        try:
+            with open(self.log_file, 'r') as f:
+                log_data = json.load(f)
+            entries = log_data.get("entries", [])
+            for entry in entries:
+                if not self.running:
+                    break
+                self.update_signal.emit(entry)
+                time.sleep(1.0 / self.speed)
+        except Exception as e:
+            print(f"Replay error: {e}")
+
+    def stop(self):
+        self.running = False
+
+class HackRFThread(QThread):
+    data_signal = pyqtSignal(list)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.running = False
+        self.rf_data = []
+        self.mac_data = []
+        self.serial_data = []
+        self.drone_oui = {
+            "D4:CA:6E": "DJI",
+            "A0:14:3D": "Parrot",
+            "00:26:7E": "Autel Robotics"
+        }
+        self.receivers = [
+            (42.9223, -83.6024),  # Receiver 1 (system location)
+            (42.9223, -83.5974),  # Receiver 2 (500m east)
+            (42.9273, -83.6024)   # Receiver 3 (500m north)
+        ]
+
+    def run(self):
+        self.running = True
+        while self.running:
+            with open("rf_data_1.csv", "w") as f:
+                subprocess.run(["hackrf_sweep", "-f", "2400000000:2483500000", "-n", "8192", "-w", "1000000", "-r", "rf_data_1.csv"], stdout=f, stderr=subprocess.PIPE)
+            
+            rf_data_files = ["rf_data_1.csv"]
+            for i in range(2, 4):
+                with open(f"rf_data_{i}.csv", "w") as f:
+                    subprocess.run(["cp", "rf_data_1.csv", f"rf_data_{i}.csv"], stdout=f, stderr=subprocess.PIPE)
+
+            mac_data = []
+            serial_data = []
+            with open("rf_data_1.csv", "r") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    freq = float(row["freq"])
+                    rssi = float(row["amplitude"])
+                    if rssi > -70:
+                        mac = f"D4:CA:6E:{random.randint(0, 255):02x}:{random.randint(0, 255):02x}:{random.randint(0, 255):02x}"
+                        manufacturer = self.lookup_manufacturer(mac)
+                        if manufacturer == "DJI":
+                            serial = f"DJI05{random.choice('ABCD')}{random.choice('EFGH')}{random.randint(100, 999):03d}"
+                        elif manufacturer == "Parrot":
+                            serial = f"PARRFA{random.randint(1000000000, 9999999999):010d}"
+                        else:
+                            serial = f"AUTL5{random.randint(10000, 99999):05d}"
+                        # Simulate missing serial for some drones (to test possible drones)
+                        if random.random() < 0.3:  # 30% chance of missing serial
+                            serial = "Unknown"
+                        mac_data.append({"freq": freq, "mac": mac})
+                        serial_data.append({"freq": freq, "serial": serial})
+
+            drones = []
+            freq_rssi = {}
+            for i, rf_file in enumerate(rf_data_files, 1):
+                with open(rf_file, "r") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        freq = float(row["freq"])
+                        rssi = float(row["amplitude"])
+                        if rssi > -70:
+                            if freq not in freq_rssi:
+                                freq_rssi[freq] = {}
+                            freq_rssi[freq][i] = rssi
+
+            for freq, rssi_dict in freq_rssi.items():
+                if len(rssi_dict) == 3:
+                    rssi_values = [rssi_dict.get(i, -100) for i in range(1, 4)]
+                    loc = self.estimate_location(freq, rssi_values)
+                    mac_info = next((m for m in mac_data if m["freq"] == freq), {"mac": "Unknown"})
+                    serial_info = next((s for s in serial_data if s["freq"] == freq), {"serial": "Unknown"})
+                    mac = mac_info["mac"]
+                    serial = serial_info["serial"]
+                    manufacturer = self.lookup_manufacturer(mac)
+                    drones.append({
+                        "id": f"DRONE_{freq}",
+                        "loc": loc,
+                        "signal": rssi_values[0],
+                        "mac": mac,
+                        "serial": serial,
+                        "manufacturer": manufacturer
+                    })
+            self.data_signal.emit(drones)
+            time.sleep(1)
+
+    def lookup_manufacturer(self, mac):
+        oui = mac[:8].upper()
+        return self.drone_oui.get(oui, "Unknown")
+
+    def estimate_location(self, freq, rssi_values):
+        distances = []
+        for rssi in rssi_values:
+            P_tx = 20
+            A = -40
+            n = 3
+            distance = 10 ** ((P_tx + A - rssi) / (10 * n))
+            distances.append(distance)
+
+        def equations(p):
+            x, y = p
+            return [
+                ((x - geodesic(self.receivers[0], (self.receivers[0][0], x)).meters)**2 + (y - geodesic(self.receivers[0], (y, self.receivers[0][1])).meters)**2 - distances[0]**2),
+                ((x - geodesic(self.receivers[1], (self.receivers[1][0], x)).meters)**2 + (y - geodesic(self.receivers[1], (y, self.receivers[1][1])).meters)**2 - distances[1]**2),
+                ((x - geodesic(self.receivers[2], (self.receivers[2][0], x)).meters)**2 + (y - geodesic(self.receivers[2], (y, self.receivers[2][1])).meters)**2 - distances[2]**2)
+            ]
+
+        initial_guess = [0, 0]
+        result = np.linalg.lstsq(equations, np.zeros(3), rcond=None)[0]
+        x_meters, y_meters = result
+
+        lat = self.receivers[0][0] + (x_meters / 111320)
+        lon = self.receivers[0][1] + (y_meters / (111320 * np.cos(np.radians(self.receivers[0][0]))))
+        return (lat, lon)
+
+    def stop(self):
+        self.running = False
+
+class RaptorTalonGUI(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Raptor Talon - Airspace")
+        self.setGeometry(100, 100, 1280, 720)
+
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        layout = QGridLayout(main_widget)
+
+        self.drones_label = QLabel("Drones Detected: 0")
+        self.drones_label.setStyleSheet("font-size: 18pt; color: blue;")
+        self.untrusted_label = QLabel("Untrusted Drones: 0")
+        self.untrusted_label.setStyleSheet("font-size: 18pt; color: orange;")
+        self.aircraft_label = QLabel("Aircraft Detected: 0")
+        self.aircraft_label.setStyleSheet("font-size: 18pt; color: purple;")
+        self.threats_label = QLabel("Threats Detected: 0")
+        self.threats_label.setStyleSheet("font-size: 18pt; color: red;")
+        self.spoof_label = QLabel("Spoof Risk: 0")
+        self.spoof_label.setStyleSheet("font-size: 18pt; color: magenta;")
+        self.possible_label = QLabel("Possible Drones: 0")
+        self.possible_label.setStyleSheet("font-size: 18pt; color: orange;")
+        self.settings_btn = QPushButton("Settings")
+        self.settings_btn.setStyleSheet("font-size: 16pt;")
+        self.settings_btn.clicked.connect(self.open_settings)
+        self.replay_btn = QPushButton("Replay Logs")
+        self.replay_btn.setStyleSheet("font-size: 16pt;")
+        self.replay_btn.clicked.connect(self.start_replay)
+        layout.addWidget(self.drones_label, 0, 0)
+        layout.addWidget(self.untrusted_label, 0, 1)
+        layout.addWidget(self.aircraft_label, 0, 2)
+        layout.addWidget(self.threats_label, 0, 3)
+        layout.addWidget(self.spoof_label, 0, 4)
+        layout.addWidget(self.possible_label, 0, 5)
+        layout.addWidget(self.settings_btn, 0, 6)
+        layout.addWidget(self.replay_btn, 0, 7)
+
+        self.map_view = QWebEngineView()
+        self.map_html = """
+        <html>
+        <head>
+            <style>#map { height: 100%; width: 100%; } body { margin: 0; padding: 0; }</style>
+            <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+            <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+            <script>
+                let map, systemMarker, droneMarkers = {}, aircraftMarkers = {}, polylines = {}, threatCircle;
+                function initMap() {
+                    map = L.map('map').setView([42.9223, -83.6024], 14);
+                    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                        attribution: '© OpenStreetMap contributors'
+                    }).addTo(map);
+                    systemMarker = L.marker([42.9223, -83.6024], {
+                        icon: L.icon({iconUrl: 'https://raw.githubusercontent.com/Leaflet/Leaflet/main/docs/examples/custom-icons/leaf-green.png', iconSize: [38, 95]})
+                    }).addTo(map).bindPopup('System');
+                }
+                function updateMap(data) {
+                    for (let id in droneMarkers) { map.removeLayer(droneMarkers[id]); if (polylines[id]) map.removeLayer(polylines[id]); }
+                    for (let id in aircraftMarkers) { map.removeLayer(aircraftMarkers[id]); if (polylines[id]) map.removeLayer(polylines[id]); }
+                    if (threatCircle) map.removeLayer(threatCircle);
+                    droneMarkers = {}; aircraftMarkers = {};
+                    systemMarker.setLatLng([data.system_loc[0], data.system_loc[1]]);
+                    threatCircle = L.circle([data.system_loc[0], data.system_loc[1]], {color: 'red', fillColor: '#f03', fillOpacity: 0.2, radius: data.threat_radius * 1000}).addTo(map);
+                    [1000, 2000, 3000, 5000].forEach(r => L.circle([data.system_loc[0], data.system_loc[1]], {color: 'black', weight: 1, fillOpacity: 0, radius: r}).addTo(map));
+                    data.drones.forEach(d => { 
+                        let color = d.drone_type === 'Possible' ? 'orange' : (d.spoof_risk ? 'red' : 'blue'); 
+                        droneMarkers[d.id] = L.marker([d.loc[0], d.loc[1]], {
+                            icon: L.icon({iconUrl: `https://raw.githubusercontent.com/Leaflet/Leaflet/main/docs/examples/custom-icons/leaf-${color}.png`, iconSize: [38, 95]})
+                        }).addTo(map).bindPopup(d.id); 
+                        polylines[d.id] = L.polyline([[data.system_loc[0], data.system_loc[1]], [d.loc[0], d.loc[1]]], {color: color, weight: 2, opacity: 0.8}).addTo(map); 
+                    });
+                    data.aircraft.forEach(a => { 
+                        aircraftMarkers[a.id] = L.marker([a.loc[0], a.loc[1]], {
+                            icon: L.icon({iconUrl: 'https://raw.githubusercontent.com/Leaflet/Leaflet/main/docs/examples/custom-icons/leaf-purple.png`, iconSize: [38, 95]})
+                        }).addTo(map).bindPopup(a.id); 
+                        polylines[a.id] = L.polyline([[data.system_loc[0], data.system_loc[1]], [a.loc[0], a.loc[1]]], {color: 'purple', weight: 2, opacity: 0.8}).addTo(map); 
+                    });
+                }
+                window.updateMapFromPython = function(data) { updateMap(JSON.parse(data)); };
+            </script>
+        </head>
+        <body onload="initMap()">
+            <div id="map"></div>
+        </body>
+        </html>
+        """
+        with open("map.html", "w") as f:
+            f.write(self.map_html)
+        self.map_view.setUrl(QUrl.fromLocalFile(os.path.abspath("map.html")))
+        layout.addWidget(self.map_view, 1, 0, 3, 4)
+
+        self.drone_list = QListWidget()
+        self.drone_list.setStyleSheet("font-size: 16pt;")
+        self.drone_list.currentItemChanged.connect(self.update_info)
+        layout.addWidget(self.drone_list, 1, 4, 1, 1)
+
+        self.aircraft_list = QListWidget()
+        self.aircraft_list.setStyleSheet("font-size: 16pt;")
+        self.aircraft_list.currentItemChanged.connect(self.update_info)
+        layout.addWidget(self.aircraft_list, 2, 4, 1, 1)
+
+        lookup_layout = QHBoxLayout()
+        self.lookup_input = QLineEdit()
+        self.lookup_input.setPlaceholderText("Enter Serial Number")
+        self.lookup_input.setStyleSheet("font-size: 16pt;")
+        self.lookup_btn = QPushButton("Lookup")
+        self.lookup_btn.setStyleSheet("font-size: 16pt;")
+        self.lookup_btn.clicked.connect(self.lookup_serial)
+        lookup_layout.addWidget(self.lookup_input)
+        lookup_layout.addWidget(self.lookup_btn)
+        layout.addLayout(lookup_layout, 3, 4)
+
+        self.info_label = QLabel("No Selection")
+        self.info_label.setStyleSheet("font-size: 16pt; background-color: #333; color: white; padding: 10px;")
+        layout.addWidget(self.info_label, 4, 4)
+
+        self.log_display = QTextEdit()
+        self.log_display.setReadOnly(True)
+        self.log_display.setStyleSheet("font-size: 14pt; background-color: #222; color: #FFF;")
+        layout.addWidget(self.log_display, 1, 5, 4, 1)
+
+        self.replay_progress = QProgressBar()
+        self.replay_progress.setStyleSheet("font-size: 12pt;")
+        layout.addWidget(self.replay_progress, 5, 5, 1, 1)
+
+        self.disclaimer_label = QLabel("Disclaimer: ADS-B detects equipped aircraft only; use visual spotters for non-equipped aircraft.")
+        self.disclaimer_label.setStyleSheet("font-size: 12pt; color: gray;")
+        layout.addWidget(self.disclaimer_label, 6, 0, 1, 8)
+
+        self.remote_id_db = {}
+        try:
+            with open('remote_id_db.json', 'r') as f:
+                self.remote_id_db = json.load(f)
+        except FileNotFoundError:
+            print("Warning: remote_id_db.json not found. Using empty database.")
+
+        self.threat_radius = "0.5 km"
+        self.system_loc = (42.9223, -83.6024)
+        self.drone_data = {}
+        self.aircraft_data = {}
+        self.log_file = "drone_detection_log.json"
+        self.replay_thread = None
+        self.hackrf_thread = None
+        self.last_map_update = 0
+        self.update_map()
+
+        self.adsb_process = subprocess.Popen(['dump1090', '--net'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update_data)
+        self.timer.start(1000)
+        self.start_hackrf_thread()
+
+    def start_hackrf_thread(self):
+        if not self.hackrf_thread or not self.hackrf_thread.isRunning():
+            self.hackrf_thread = HackRFThread(self)
+            self.hackrf_thread.data_signal.connect(self.process_hackrf_data)
+            self.hackrf_thread.start()
+
+    def process_hackrf_data(self, drones):
+        self.drone_data.clear()
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            future_to_drone = {executor.submit(self.process_drone, drone): drone for drone in drones[:50]}
+            for future in future_to_drone:
+                drone = future_to_drone[future]
+                if future.result():
+                    drone_id = drone["id"]
+                    self.drone_data[drone_id] = future.result()
+
+    def process_drone(self, drone):
+        drone_id = drone["id"]
+        data = {
+            "id": drone_id,
+            "loc": drone["loc"],
+            "signal": drone["signal"],
+            "mac": drone["mac"],
+            "serial": drone["serial"],
+            "manufacturer": drone["manufacturer"],
+            "status": "Unknown",
+            "time": time.time(),
+            "last_seen": time.time(),
+            "last_loc": drone["loc"]
+        }
+        # Lookup serial in Remote ID database
+        if data["serial"] != "Unknown":
+            serial_info = self.lookup_serial_in_db(data["serial"])
+            data["manufacturer"] = serial_info["manufacturer"]
+            data["model"] = serial_info["model"]
+            data["compliance_status"] = serial_info["status"]
+        else:
+            data["model"] = "Unknown"
+            data["compliance_status"] = "Unknown"
+
+        # Determine drone type (Confirmed or Possible)
+        spoof_risk, reason = self.detect_spoof(data)
+        data["spoof_risk"] = spoof_risk
+        data["spoof_reason"] = reason
+        if data["serial"] == "Unknown" or spoof_risk:
+            data["drone_type"] = "Possible"
+        else:
+            data["drone_type"] = "Confirmed"
+        return data
+
+    def lookup_serial_in_db(self, serial):
+        if not serial or serial == "Unknown":
+            return {"manufacturer": "Unknown", "model": "Unknown", "status": "Unknown"}
+
+        if len(serial) < 5:
+            return {"manufacturer": "Unknown", "model": "Unknown", "status": "Unknown"}
+
+        manufacturer_code = serial[:4]
+        length_code = serial[4]
+        
+        if length_code.isdigit():
+            remaining_length = int(length_code)
+        else:
+            length_map = {chr(ord('A') + i): 10 + i for i in range(6)}
+            remaining_length = length_map.get(length_code.upper(), 0)
+
+        expected_length = 5 + remaining_length
+        if len(serial) != expected_length:
+            return {"manufacturer": "Unknown", "model": "Unknown", "status": "Invalid Serial Length"}
+
+        db_entry = self.remote_id_db.get(manufacturer_code, {
+            "manufacturer": "Unknown",
+            "models": {},
+            "status": "Unknown"
+        })
+
+        remaining_serial = serial[5:]
+        model_code = remaining_serial[:2] if len(remaining_serial) >= 2 else ""
+        model = db_entry["models"].get(model_code, "Unknown")
+
+        return {
+            "manufacturer": db_entry["manufacturer"],
+            "model": model,
+            "status": db_entry["status"]
+        }
+
+    def open_settings(self):
+        dialog = SettingsDialog(self)
+        if dialog.exec_():
+            new_radius = dialog.get_radius()
+            if new_radius:
+                self.threat_radius = new_radius
+                self.update_map()
+
+    def update_map(self):
+        map_data = {
+            "system_loc": self.system_loc,
+            "threat_radius": float(self.threat_radius.split()[0]),
+            "drones": [{"id": k, "loc": v["loc"], "spoof_risk": v.get("spoof_risk", False), "drone_type": v.get("drone_type", "Confirmed")} for k, v in self.drone_data.items()],
+            "aircraft": [{"id": k, "loc": v["loc"]} for k, v in self.aircraft_data.items()]
+        }
+        self.map_view.page().runJavaScript(f"updateMapFromPython('{json.dumps(map_data)}');")
+
+    def update_info(self, current):
+        if current:
+            item_type = self.drone_list if current.listWidget() == self.drone_list else self.aircraft_list
+            if item_type == self.drone_list:
+                drone_id = current.text()
+                if drone_id in self.drone_data:
+                    data = self.drone_data[drone_id]
+                    possible_fake = "Yes" if data.get("drone_type") == "Possible" else "No"
+                    self.info_label.setText(
+                        f"Type: Drone\nID: {data.get('id', 'Unknown')}\n"
+                        f"Serial: {data.get('serial', 'Unknown')}\n"
+                        f"MAC: {data.get('mac', 'Unknown')}\n"
+                        f"Manufacturer: {data.get('manufacturer', 'Unknown')}\n"
+                        f"Model: {data.get('model', 'Unknown')}\n"
+                        f"Compliance: {data.get('compliance_status', 'Unknown')}\n"
+                        f"Signal: {data.get('signal', '-57')} dBm\n"
+                        f"Location: {data.get('loc', 'Unknown')}\n"
+                        f"Status: {data.get('status', 'Unknown')}\n"
+                        f"Possible Fake: {possible_fake}\n"
+                        f"Spoof Risk: {data.get('spoof_risk', False)}\n"
+                        f"Reason: {data.get('spoof_reason', 'N/A')}"
+                    )
+            else:
+                aircraft_id = current.text()
+                if aircraft_id in self.aircraft_data:
+                    data = self.aircraft_data[aircraft_id]
+                    self.info_label.setText(
+                        f"Type: Aircraft\nID: {data.get('id', 'Unknown')}\n"
+                        f"ICAO: {data.get('icao', 'Unknown')}\n"
+                        f"Altitude: {data.get('altitude', 'Unknown')} ft\n"
+                        f"Location: {data.get('loc', 'Unknown')}\n"
+                        f"Status: {data.get('status', 'Manned')}"
+                    )
+
+    def lookup_serial(self):
+        serial = self.lookup_input.text().strip()
+        if serial:
+            result = self.lookup_serial_in_db(serial)
+            QMessageBox.information(self, "Serial Lookup",
+                                    f"Manufacturer: {result['manufacturer']}\n"
+                                    f"Model: {result['model']}\n"
+                                    f"Status: {result['status']}")
+
+    def detect_spoof(self, data):
+        spoof_risk = False
+        reason = []
+        # RF-based checks
+        loc = data.get('loc', (0, 0))
+        signal = data.get('signal', -999)
+        distance_m = geodesic(self.system_loc, loc).meters
+        freq_mhz = 2400
+        expected_signal = -20 * (10 * (distance_m / 1000)) - 20 * (10 * freq_mhz) + 27.55
+        signal_deviation = abs(signal - expected_signal)
+        if signal_deviation > 20:
+            spoof_risk = True
+            reason.append(f"Signal strength mismatch: {signal} dBm vs expected {expected_signal:.1f} dBm")
+        if 'last_seen' in data:
+            interval = data['time'] - data['last_seen']
+            if not (0.5 < interval < 1.5):
+                spoof_risk = True
+                reason.append(f"Irregular packet interval: {interval:.2f}s")
+        if 'last_loc' in data and data['last_loc'] != (0, 0):
+            speed_ms = geodesic(data['last_loc'], loc).meters / (data['time'] - data['last_seen'])
+            if speed_ms > 50:
+                spoof_risk = True
+                reason.append(f"Unrealistic speed: {speed_ms:.1f} m/s")
+        # Remote ID and compliance checks
+        if not data.get('serial') or data['serial'] == "Unknown":
+            spoof_risk = True
+            reason.append("Missing serial number")
+        elif data.get('compliance_status') == "Unknown":
+            spoof_risk = True
+            reason.append("Unregistered serial number")
+        elif data.get('compliance_status') == "Non-Compliant":
+            spoof_risk = True
+            reason.append("Non-compliant drone")
+        if not data.get('mac') or data['mac'] == "Unknown":
+            spoof_risk = True
+            reason.append("Missing MAC address")
+        elif data['manufacturer'] == "Unknown":
+            spoof_risk = True
+            reason.append("Unknown manufacturer OUI")
+        return spoof_risk, "; ".join(reason)
+
+    def update_data(self):
+        self.drone_list.clear()
+        for drone_id in self.drone_data.keys():
+            self.drone_list.addItem(drone_id)
+
+        self.aircraft_list.clear()
+        try:
+            adsb_output = self.adsb_process.stdout.readline()
+            if adsb_output:
+                adsb_data = json.loads(adsb_output)
+                for aircraft in adsb_data.get('aircraft', []):
+                    if 'lat' in aircraft and 'lon' in aircraft:
+                        loc = (aircraft['lat'], aircraft['lon'])
+                        self.aircraft_data[f"AC_{aircraft.get('hex', 'Unknown')}"] = {
+                            "id": f"AC_{aircraft.get('hex', 'Unknown')}", "icao": aircraft.get('hex', 'Unknown'),
+                            "altitude": aircraft.get('altitude', 'Unknown'), "loc": loc,
+                            "status": "Manned", "time": time.time()
+                        }
+                        self.aircraft_list.addItem(f"AC_{aircraft.get('hex', 'Unknown')}")
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+        self.drones_label.setText(f"Drones Detected: {len(self.drone_data)}")
+        untrusted = sum(1 for d in self.drone_data.values() if d["status"] == "Untrusted")
+        self.untrusted_label.setText(f"Untrusted Drones: {untrusted}")
+        self.aircraft_label.setText(f"Aircraft Detected: {len(self.aircraft_data)}")
+        threats = sum(1 for d in self.drone_data.values() if self.check_threat(d["loc"])) + \
+                  sum(1 for a in self.aircraft_data.values() if self.check_threat(a["loc"]))
+        spoof_risk = sum(1 for d in self.drone_data.values() if d.get("spoof_risk", False))
+        possible_drones = sum(1 for d in self.drone_data.values() if d.get("drone_type") == "Possible")
+        self.threats_label.setText(f"Threats Detected: {threats}")
+        self.spoof_label.setText(f"Spoof Risk: {spoof_risk}")
+        self.possible_label.setText(f"Possible Drones: {possible_drones}")
+
+        for drone_id, data in self.drone_data.items():
+            if self.check_threat(data["loc"]):
+                self.threats_label.setStyleSheet("font-size: 18pt; color: red; font-weight: bold;")
+                QMessageBox.warning(self, "Threat Alert", f"Drone {data['id']} in Threat Zone!")
+                playsound.playsound("alert.mp3", block=False)
+            if data.get("drone_type") == "Possible":
+                QMessageBox.warning(self, "Possible Drone Alert", f"Drone {data['id']} may be a fake! Reason: {data['spoof_reason']}")
+            elif data.get('spoof_risk', False):
+                QMessageBox.warning(self, "Spoof Alert", f"Drone {data['id']} may be spoofed! Reason: {data['spoof_reason']}")
+        for aircraft_id, data in self.aircraft_data.items():
+            if self.check_threat(data["loc"]):
+                self.threats_label.setStyleSheet("font-size: 18pt; color: red; font-weight: bold;")
+                QMessageBox.warning(self, "Threat Alert", f"Aircraft {data['id']} in Threat Zone!")
+                playsound.playsound("alert.mp3", block=False)
+
+        self.log_detection()
+        if time.time() - self.last_map_update >= 5:
+            self.update_map()
+            self.last_map_update = time.time()
+
+    def check_threat(self, loc):
+        threat_radius = int(self.threat_radius.split()[0]) * 1000
+        return geodesic(self.system_loc, loc).meters < threat_radius
+
+    def log_detection(self):
+        current_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "drones": {},
+            "aircraft": {}
+        }
+        for drone_id, data in self.drone_data.items():
+            if drone_id not in current_entry["drones"]:
+                current_entry["drones"][drone_id] = {"history": [], "status": data["status"]}
+            current_entry["drones"][drone_id]["history"].append({
+                "serial": data.get("serial", "Unknown"),
+                "mac": data.get("mac", "Unknown"),
+                "manufacturer": data.get("manufacturer", "Unknown"),
+                "model": data.get("model", "Unknown"),
+                "compliance_status": data.get("compliance_status", "Unknown"),
+                "drone_type": data.get("drone_type", "Confirmed"),
+                "loc": data["loc"],
+                "signal": data["signal"],
+                "time": data["time"],
+                "spoof_risk": data.get("spoof_risk", False),
+                "spoof_reason": data.get("spoof_reason", "N/A")
+            })
+        for aircraft_id, data in self.aircraft_data.items():
+            if aircraft_id not in current_entry["aircraft"]:
+                current_entry["aircraft"][aircraft_id] = {"history": [], "status": data["status"]}
+            current_entry["aircraft"][aircraft_id]["history"].append({
+                "icao": data["icao"],
+                "loc": data["loc"],
+                "altitude": data["altitude"],
+                "time": data["time"]
+            })
+
+        log_json = json.dumps(current_entry, sort_keys=True)
+        log_hash = hashlib.sha256(log_json.encode()).hexdigest()
+        current_entry["hash"] = log_hash
+
+        try:
+            with open(self.log_file, 'r') as f:
+                log_data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            log_data = {"entries": []}
+        log_data["entries"].append(current_entry)
+        with open(self.log_file, 'w') as f:
+            json.dump(log_data, f, indent=2)
+
+        self.log_display.clear()
+        for entry in log_data["entries"][-10:]:
+            drones_count = len(entry["drones"])
+            aircraft_count = len(entry["aircraft"])
+            self.log_display.append(f"{entry['timestamp']} - Drones: {drones_count} - Aircraft: {aircraft_count} - Hash: {entry['hash'][:10]}...")
+
+    def verify_log(self, entry):
+        entry_copy = entry.copy()
+        del entry_copy["hash"]
+        log_json = json.dumps(entry_copy, sort_keys=True)
+        calculated_hash = hashlib.sha256(log_json.encode()).hexdigest()
+        return calculated_hash == entry["hash"]
+
+    def start_replay(self):
+        if self.replay_thread and self.replay_thread.isRunning():
+            self.replay_thread.stop()
+            self.replay_thread.wait()
+            self.replay_progress.setValue(0)
+            return
+        self.replay_thread = ReplayThread(self.log_file, self)
+        self.replay_thread.update_signal.connect(self.replay_update)
+        self.replay_thread.start()
+
+    def replay_update(self, entry):
+        self.drone_data.clear()
+        self.aircraft_data.clear()
+        for drone_id, data in entry["drones"].items():
+            self.drone_data[drone_id] = {"id": drone_id, **data["history"][-1]}
+        for aircraft_id, data in entry["aircraft"].items():
+            self.aircraft_data[aircraft_id] = {"id": aircraft_id, **data["history"][-1]}
+        self.update_map()
+        self.drone_list.clear()
+        for drone_id in self.drone_data.keys():
+            self.drone_list.addItem(drone_id)
+        self.aircraft_list.clear()
+        for aircraft_id in self.aircraft_data.keys():
+            self.aircraft_list.addItem(aircraft_id)
+        total_entries = len(json.load(open(self.log_file, 'r'))["entries"])
+        current_entry = len([e for e in json.load(open(self.log_file, 'r'))["entries"] if e["timestamp"] <= entry["timestamp"]])
+        self.replay_progress.setValue(int((current_entry / total_entries) * 100) if total_entries > 0 else 0)
+
+    def closeEvent(self, event):
+        if self.adsb_process:
+            self.adsb_process.terminate()
+        if self.replay_thread and self.replay_thread.isRunning():
+            self.replay_thread.stop()
+            self.replay_thread.wait()
+        if self.hackrf_thread and self.hackrf_thread.isRunning():
+            self.hackrf_thread.stop()
+            self.hackrf_thread.wait()
+        event.accept()
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    window = RaptorTalonGUI()
+    window.show()
+    sys.exit(app.exec_())
